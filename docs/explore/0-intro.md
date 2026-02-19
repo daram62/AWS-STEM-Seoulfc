@@ -4,9 +4,7 @@ sidebar_position: 1
 
 # Welcome to AWS STEM Cloud Day 🎉
 
-<div style={{textAlign: 'center', margin: '2rem 0'}}>
-  <img src="/img/peccy-welcome.png" alt="Peccy welcomes you" style={{maxWidth: '300px'}} />
-</div>
+
 
 안녕하세요, 서울금융고등학교 학생 여러분! 
 
