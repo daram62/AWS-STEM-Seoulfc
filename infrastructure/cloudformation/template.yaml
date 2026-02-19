@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS STEM Workshop - Bedrock Agent 테스트 웹앱'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-stem-agent-webapp
+    Description: 프로젝트 이름 (리소스 이름에 사용)
+
+Resources:
+  # ==========================================
+  # Lambda Execution Role
+  # ==========================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAgentInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeAgent
+                  - bedrock-agent-runtime:InvokeAgent
+                Resource: '*'
+
+  # ==========================================
+  # Lambda Function (Agent Invoker)
+  # ==========================================
+  AgentInvokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-invoker'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          bedrock_agent_runtime = boto3.client(
+              'bedrock-agent-runtime',
+              region_name=os.environ['REGION']
+          )
+
+          def lambda_handler(event, context):
+              # CORS Preflight
+              if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': ''
+                  }
+              
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  agent_id = body.get('agentId')
+                  agent_alias_id = body.get('agentAliasId', 'TSTALIASID')
+                  session_id = body.get('sessionId', 'default-session')
+                  user_input = body.get('input', '')
+                  
+                  if not agent_id or not user_input:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Access-Control-Allow-Origin': '*'},
+                          'body': json.dumps({
+                              'error': 'agentId와 input은 필수입니다.'
+                          })
+                      }
+                  
+                  print(f"Invoking Agent: {agent_id} with input: {user_input}")
+                  
+                  # Bedrock Agent 호출
+                  response = bedrock_agent_runtime.invoke_agent(
+                      agentId=agent_id,
+                      agentAliasId=agent_alias_id,
+                      sessionId=session_id,
+                      inputText=user_input
+                  )
+                  
+                  # Stream 응답 처리
+                  output_text = ""
+                  for event_stream in response.get('completion', []):
+                      if 'chunk' in event_stream:
+                          chunk = event_stream['chunk']
+                          if 'bytes' in chunk:
+                              output_text += chunk['bytes'].decode('utf-8')
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'response': output_text,
+                          'timestamp': datetime.now().isoformat()
+                      }, ensure_ascii=False)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({
+                          'error': f'Agent 호출 실패: {str(e)}'
+                      }, ensure_ascii=False)
+                  }
+
+  # ==========================================
+  # Lambda Permission for API Gateway
+  # ==========================================
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentInvokerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*'
+
+  # ==========================================
+  # API Gateway (HTTP API)
+  # ==========================================
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+        MaxAge: 300
+
+  # API Integration
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AgentInvokerFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # API Route
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'POST /invoke'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  # API Stage (Auto Deploy)
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ApiGateway
+      StageName: prod
+      AutoDeploy: true
+
+  # ==========================================
+  # S3 Bucket (Web App Hosting)
+  # ==========================================
+  WebAppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${AWS::AccountId}-webapp'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+
+  # S3 Bucket Policy (Public Read)
+  WebAppBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebAppBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${WebAppBucket.Arn}/*'
+
+  # ==========================================
+  # CloudFront Distribution
+  # ==========================================
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName} Web App'
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebAppBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          Compress: true
+          DefaultTTL: 86400
+          MinTTL: 0
+          MaxTTL: 31536000
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_100
+
+  # CloudFront용 S3 Bucket Policy 업데이트
+  WebAppBucketPolicyForCloudFront:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebAppBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${WebAppBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+# ==========================================
+# Outputs
+# ==========================================
+Outputs:
+  WebAppURL:
+    Description: '웹앱 URL (CloudFront) - 이 URL로 접속하세요!'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebAppURL'
+
+  WebAppBucketName:
+    Description: 'S3 버킷 이름 (웹앱 파일 업로드용)'
+    Value: !Ref WebAppBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  ApiEndpoint:
+    Description: 'API Gateway Endpoint'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  CloudFrontDistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+
+  Region:
+    Description: '배포된 리전'
+    Value: !Ref AWS::Region

@@ -1,0 +1,23 @@
+[
+  {
+    "type": "orange",
+    "image": "lambda.png",
+    "service": "Step 1 : Explore",
+    "description": "AWS 알아보기",
+    "mdlink": "/docs/explore/intro"
+  },
+  {
+    "type": "green",
+    "image": "bedrock.png",
+    "service": "Step 2 : Hands-On",
+    "description": "Bedrock을 이용한 실습",
+    "mdlink": "/docs/bedrock/intro"
+  },
+  {
+    "type": "purple",
+    "image": "hackathon.png",
+    "service": "Step 3 : Project",
+    "description": "우리만의 AI Agent 만들기",
+    "mdlink": "/docs/project/project"
+  }
+]

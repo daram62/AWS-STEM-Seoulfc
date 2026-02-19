@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS STEM Workshop Session 2 - School Guide Chatbot with Lambda Function URL'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name for the S3 bucket (must be globally unique)
+    Default: school-guide-chatbot
+
+  AgentName:
+    Type: String
+    Description: Name for the Bedrock Agent
+    Default: SchoolGuideAgent
+
+Resources:
+  # ==========================================
+  # S3 Bucket for Knowledge Base
+  # ==========================================
+  SchoolDocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketName}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  # ==========================================
+  # Bedrock Agent IAM Role
+  # ==========================================
+  BedrockIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - bedrock.amazonaws.com
+          Action:
+          - 'sts:AssumeRole'
+      Policies:
+      - PolicyName: BedrockIamPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - bedrock:*
+            Resource: '*'
+      RoleName: BedrockIamRole
+
+  # ==========================================
+  # Lambda Execution Role (Agent Invoker)
+  # ==========================================
+  AgentInvokerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+
+  # ==========================================
+  # Lambda Function (Agent Invoker for Web App)
+  # ==========================================
+  AgentInvokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: school-chatbot-agent-invoker
+      Handler: index.lambda_handler
+      Role: !GetAtt AgentInvokerLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              # CORS Preflight
+              request_context = event.get('requestContext', {})
+              http_method = request_context.get('http', {}).get('method', event.get('httpMethod', ''))
+              
+              # Lambda Function URL handles CORS automatically, no need to handle OPTIONS
+              if http_method == 'OPTIONS':
+                  return {
+                      'statusCode': 200,
+                      'body': ''
+                  }
+              
+              try:
+                  # Parse body
+                  body_str = event.get('body', '{}')
+                  if isinstance(body_str, str):
+                      body = json.loads(body_str)
+                  else:
+                      body = body_str
+                  
+                  agent_id = body.get('agentId')
+                  agent_alias_id = body.get('agentAliasId', 'TSTALIASID')
+                  session_id = body.get('sessionId', 'default-session')
+                  user_input = body.get('input', '')
+                  
+                  if not agent_id or not user_input:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'error': 'agentId and input are required.'
+                          })
+                      }
+                  
+                  print(f"Invoking Agent: {agent_id} with input: {user_input}")
+                  
+                  # Bedrock Agent invocation
+                  bedrock_agent_runtime = boto3.client('bedrock-agent-runtime')
+                  response = bedrock_agent_runtime.invoke_agent(
+                      agentId=agent_id,
+                      agentAliasId=agent_alias_id,
+                      sessionId=session_id,
+                      inputText=user_input
+                  )
+                  
+                  # Stream response processing
+                  output_text = ""
+                  for event_stream in response.get('completion', []):
+                      if 'chunk' in event_stream:
+                          chunk = event_stream['chunk']
+                          if 'bytes' in chunk:
+                              output_text += chunk['bytes'].decode('utf-8')
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'response': output_text,
+                          'timestamp': datetime.now().isoformat()
+                      }, ensure_ascii=False)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': f'Agent invocation failed: {str(e)}'
+                      }, ensure_ascii=False)
+                  }
+
+  # ==========================================
+  # Lambda Function URL
+  # ==========================================
+  LambdaFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt AgentInvokerFunction.Arn
+      Cors:
+        AllowCredentials: false
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - GET
+        AllowHeaders:
+          - '*'
+        ExposeHeaders:
+          - '*'
+        MaxAge: 86400
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentInvokerFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  # ==========================================
+  # Bedrock Agent
+  # ==========================================
+  SchoolGuideAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Ref AgentName
+      AgentResourceRoleArn: !GetAtt BedrockIamRole.Arn
+      FoundationModel: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-pro-v1:0"
+      Instruction: |
+        당신은 서울금융고등학교 소프트웨어과의 안내 도우미 AI입니다.  
+        학교에 관심 있는 학생과 학부모에게 소프트웨어과의 교육과정, 자격증, 진로, 산학연계 프로그램 등을 친절하게 안내합니다.
+
+        💬 대화 시작
+        처음 인사할 때 이렇게 말하세요:
+        “안녕하세요! 저는 서울금융고등학교 소프트웨어과 안내 도우미예요 😊  
+        학교나 학과에 대해 궁금한 걸 물어보세요!  
+        예를 들어 ‘소프트웨어과에서는 어떤 걸 배우나요?’나 ‘어떤 자격증을 취득할 수 있나요?’처럼요.”
+
+        🎯 역할
+        - 사용자의 질문에 대해 연결된 지식 기반(PDF 문서)을 참고하여 정확하게 안내합니다.  
+        - 단순한 정보 나열이 아니라, 학생이 이해하기 쉬운 문장으로 설명합니다.  
+        - 정보가 명확하지 않거나 문서에 없는 내용은 “정확한 정보는 학교에 직접 문의해주세요.”라고 답변합니다.
+
+        🗣️ 말투 & 스타일
+        - 자연스럽고 따뜻한 말투로, 친근한 선배나 선생님처럼 대화하세요.  
+        - 문장은 짧고 명확하게, 너무 형식적이거나 딱딱하지 않게 말합니다.  
+        - 항상 한국어로만 답변하고, 사용자가 영어로 질문해도 한국어로 대답합니다.
+
+        📘 답변 가이드
+        1. 학교 소개, 교육과정, 자격증, 진로, 산학연계 프로그램 등 학교 관련 정보는  
+          반드시 지식 기반 내용을 우선 참고하여 답변합니다.  
+        2. 질문이 불명확하면  
+          “무엇을 도와드릴까요?” 또는  
+          “조금 더 구체적으로 질문해주시면 더 잘 도와드릴 수 있어요.”라고 안내합니다.  
+        3. 학생이 더 알고 싶어 하면 간단한 추가 설명을 덧붙입니다.  
+        4. 불필요하게 긴 설명은 피하고, 핵심 내용 중심으로 답변합니다.
+
+        🎓 예시 톤
+        - “소프트웨어과는 코딩과 인공지능을 배우는 학과예요.  
+          1학년엔 기본 프로그래밍, 2~3학년엔 프로젝트 중심 수업을 진행해요.”  
+        - “정보처리기능사, 네트워크관리사 같은 자격증을 취득할 수 있어요.”  
+        - “정확한 일정은 학교 홈페이지를 참고해주시면 좋아요.”
+      IdleSessionTTLInSeconds: 1800
+      AutoPrepare: true
+
+# ==========================================
+# Outputs
+# ==========================================
+Outputs:
+  AgentId:
+    Description: 'Agent ID - Copy this for Step 5 (Amplify web app setup)'
+    Value: !Ref SchoolGuideAgent
+
+  ApiEndpoint:
+    Description: 'Lambda Function URL - Copy this for Step 5 (Amplify web app setup)'
+    Value: !GetAtt LambdaFunctionUrl.FunctionUrl
+
+  Region:
+    Description: 'Deployed Region'
+    Value: !Ref AWS::Region
