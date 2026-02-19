@@ -4,8 +4,11 @@
  * work well for content-centric websites.
  */
 
+@import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css");
+
 /* You can override the default Infima variables here. */
 :root {
+  --ifm-font-family-base: "Pretendard", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
   --ifm-color-primary: #ff9901;
   --ifm-color-primary-dark: #e68a00;
   --ifm-color-primary-darker: #da8200;
